@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.streamlit/secrets.toml
+.env
+.env.*
+*.db
+*.db-shm
+*.db-wal
+sake_brix_backup_*.db
+.DS_Store
+Thumbs.db
+.vscode/
