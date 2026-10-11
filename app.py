@@ -2,39 +2,35 @@ from __future__ import annotations
 
 import hashlib
 import json
-import pathlib
-import time
-import uuid
+import os
+from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
+from typing import Any
 
 import pandas as pd
 import streamlit as st
+from pydantic import BaseModel, ConfigDict
+from streamlit.components.v2 import component
 
-try:
-    from google import genai
-    from google.genai import types
-    GENAI_AVAILABLE = True
-except ImportError:  # App still runs for manual entry when the optional SDK is absent.
-    genai = None
-    types = None
-    GENAI_AVAILABLE = False
-
-from sake_brix_core import (
-    COLUMNS_29,
-    calculate_statistics,
-    connect_db,
-    export_records,
-    get_jst_now,
-    init_db,
-    normalize_import_records,
-    restore_records,
-    save_measurement,
+from data_model import MEASUREMENT_COLUMNS, NUMERIC_SPEC_FIELDS, json_safe, normalize_kana, parse_aliases, validate_measurement_input
+from db import (
+    delete_measurement,
+    ensure_schema,
+    export_json_records,
+    get_measurement,
+    get_measurements,
+    find_name_candidates,
+    get_search_cache,
+    insert_measurement,
+    put_search_cache,
+    restore_json_records,
+    search_cache_key,
+    update_measurement,
 )
+from search_sources import DEFAULT_SEARCH_MODEL, SOURCE_REGISTRY, canonical_url, direct_source_search_url, grounded_product_search
 
-# -----------------------------------------------------------------------------
-# Page and database startup
-# -----------------------------------------------------------------------------
 st.set_page_config(
-    page_title="日本酒 糖度測定＆総合スペック管理ツール",
+    page_title="日本酒 糖度測定・スペック管理 V2",
     page_icon="🍶",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -43,802 +39,1167 @@ st.set_page_config(
 st.markdown(
     """
     <style>
-    html, body, [class*="css"] {
-        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-    }
+    html, body, [class*="css"] { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
     @media (max-width: 768px) {
-        h1 { font-size: 1.5rem !important; }
-        h2 { font-size: 1.25rem !important; }
-        h3 { font-size: 1.1rem !important; }
-        .stTextInput input, .stNumberInput input, .stSelectbox, .stTextArea textarea {
-            font-size: 16px !important;
-        }
-        .stButton button { width: 100%; font-size: 1rem !important; padding: 0.6rem !important; }
+      h1 { font-size: 1.55rem !important; }
+      h2 { font-size: 1.25rem !important; }
+      .stTextInput input, .stTextArea textarea, .stSelectbox, .stNumberInput input { font-size: 16px !important; }
+      .stButton button { min-height: 2.75rem; width: 100%; }
     }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-BASE_DIR = pathlib.Path(__file__).resolve().parent
-DB_NAME = BASE_DIR / "sake_brix.db"
-SPEC_OPTIONS = [
-    "未選択", "純米酒", "特別純米酒", "純米吟醸", "吟醸酒",
-    "純米大吟醸", "大吟醸", "本醸造", "普通酒", "その他",
-]
-MODEL_DEFAULT = "gemini-3.8-flash"
-
-try:
-    DB_STARTUP_STATUS = init_db(DB_NAME)
-except Exception as exc:
-    st.error(
-        "データベースの初期化・移行を安全に完了できなかったため、アプリを停止しました。\n\n"
-        f"詳細: {exc}\n\n"
-        "元のDBファイルと自動バックアップを削除せず、まずDBファイルのコピーを保管してください。"
-    )
-    st.stop()
-
-if DB_STARTUP_STATUS.get("migrated"):
-    st.sidebar.success(
-        f"DB移行完了: {DB_STARTUP_STATUS.get('migrated_count', 0)}件\n"
-        f"バックアップ: {DB_STARTUP_STATUS.get('backup_path')}"
-    )
-
-# -----------------------------------------------------------------------------
-# Session state defaults. All widgets use their keys as the source of truth.
-# Callbacks update keys before the next render to avoid stale form values.
-# -----------------------------------------------------------------------------
-FORM_TEXT_DEFAULTS = {
-    "input_brewery": "",
-    "input_name": "",
-    "input_by": "",
-    "input_lot": "",
-    "input_state": "",
-    "input_rice": "",
-    "input_yeast": "",
-    "input_memo": "",
+SPEC_OPTIONS = ["未選択", "純米酒", "特別純米酒", "純米吟醸", "吟醸酒", "純米大吟醸", "大吟醸", "本醸造", "普通酒", "その他"]
+FIELD_LABELS = {
+    "alcohol": "アルコール度数 (%)",
+    "smv": "日本酒度",
+    "acidity": "酸度",
+    "amino_acid": "アミノ酸度",
+    "rice_polished": "精米歩合 (%)",
 }
-FORM_OTHER_DEFAULTS = {
-    "input_spec": "未選択",
-    "candidate_select_box": 0,
-    "selected_candidate": {},
-    "ai_candidates": [],
-    "current_image_hash": None,
-    "last_inference_time": None,
-    "save_notice": None,
-    "db_notice": None,
-    "restore_notice": None,
+
+class LabelCandidate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    brewery: str | None = None
+    name: str | None = None
+    name_kana: str | None = None
+    brewery_kana: str | None = None
+    spec_category: str | None = None
+    processing_state: str | None = None
+    by_year: str | None = None
+    lot_date: str | None = None
+    alcohol: float | None = None
+    smv: float | None = None
+    acidity: float | None = None
+    amino_acid: float | None = None
+    rice_polished: float | None = None
+    rice_used: str | None = None
+    yeast: str | None = None
+
+class LabelScanResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    labels: list[LabelCandidate]
+
+WHEEL_HTML = """
+<div class="brix-input-panel" role="group" aria-label="糖度実測値の直接入力とドラムロール">
+  <div class="brix-measurement-rows"></div>
+  <div class="brix-wheel-panel">
+    <div class="brix-wheel-title"><strong>ドラムロール</strong><span>編集する測定枠を選択</span></div>
+    <select class="brix-target-select" aria-label="ホイールで編集する測定枠">
+      <option value="1">測定1</option><option value="2">測定2</option><option value="3">測定3</option>
+      <option value="4">測定4</option><option value="5">測定5</option><option value="6">測定6</option>
+    </select>
+    <div class="brix-wheel-columns"></div>
+    <div class="brix-wheel-readout" aria-live="polite">未選択</div>
+  </div>
+</div>
+"""
+WHEEL_CSS = """
+.brix-input-panel { width:100%; box-sizing:border-box; color:var(--st-text-color); font-family:inherit; }
+.brix-measurement-rows { display:flex; flex-direction:column; gap:4px; margin-bottom:10px; }
+.brix-measurement-row { display:grid; grid-template-columns:minmax(94px, .8fr) minmax(0, 2fr); align-items:center; gap:8px; min-width:0; }
+.brix-row-check { display:flex; align-items:center; gap:6px; min-width:0; font-size:.88rem; cursor:pointer; }
+.brix-row-check input { width:17px; height:17px; flex:0 0 auto; margin:0; accent-color:var(--st-primary-color); }
+.brix-row-input { box-sizing:border-box; width:100%; min-width:0; height:34px; padding:5px 9px; border:1px solid var(--st-border-color); border-radius:7px; background:var(--st-background-color); color:var(--st-text-color); font:inherit; font-size:16px; font-variant-numeric:tabular-nums; }
+.brix-row-input::placeholder { color:var(--st-secondary-text-color); opacity:.8; }
+.brix-row-input:focus { outline:2px solid var(--st-primary-color); outline-offset:1px; }
+.brix-wheel-panel { border-top:1px solid var(--st-border-color); padding-top:7px; }
+.brix-wheel-title { display:flex; flex-wrap:wrap; align-items:baseline; gap:6px; margin:0 0 4px; font-size:.75rem; color:var(--st-secondary-text-color); }
+.brix-wheel-title strong { color:var(--st-text-color); font-size:.86rem; }
+.brix-target-select { box-sizing:border-box; width:100%; max-width:260px; height:32px; margin-bottom:5px; padding:4px 8px; border:1px solid var(--st-border-color); border-radius:7px; background:var(--st-background-color); color:var(--st-text-color); font:inherit; font-size:.9rem; }
+.brix-wheel-columns { display:grid; grid-template-columns:1.2fr 1fr 1fr; gap:5px; width:100%; }
+.brix-wheel-part { min-width:0; }
+.brix-wheel-part-label { font-size:.69rem; text-align:center; color:var(--st-secondary-text-color); margin-bottom:2px; line-height:1.15; }
+.brix-wheel-column { height:78px; overflow-y:auto; overflow-x:hidden; overscroll-behavior-y:contain; touch-action:pan-y; -webkit-overflow-scrolling:touch; scroll-snap-type:y mandatory; scrollbar-width:none; border:1px solid var(--st-border-color); border-radius:7px; background:var(--st-secondary-background-color); }
+.brix-wheel-column::-webkit-scrollbar { display:none; }
+.brix-wheel-list { padding:25px 2px; }
+.brix-wheel-option { display:flex; justify-content:center; align-items:center; box-sizing:border-box; width:100%; height:28px; border:0; border-radius:5px; margin:0; padding:0 2px; background:transparent; color:var(--st-text-color); font-size:.98rem; font-weight:500; font-variant-numeric:tabular-nums; scroll-snap-align:center; cursor:pointer; }
+.brix-wheel-option.is-active { color:var(--st-primary-color); background:var(--st-background-color); box-shadow:inset 0 0 0 1.5px var(--st-primary-color); font-weight:750; }
+.brix-wheel-readout { text-align:center; font-size:.95rem; font-weight:750; font-variant-numeric:tabular-nums; margin-top:3px; min-height:1.2em; }
+@media (max-width:480px) {
+  .brix-measurement-rows { gap:3px; margin-bottom:8px; }
+  .brix-measurement-row { grid-template-columns:minmax(92px, .85fr) minmax(0, 1.7fr); gap:6px; }
+  .brix-row-check { font-size:.82rem; }
+  .brix-row-input { height:33px; padding:4px 7px; }
+  .brix-wheel-column { height:76px; }
+  .brix-wheel-list { padding:24px 1px; }
+  .brix-wheel-option { height:28px; font-size:.94rem; }
 }
-for key, default in {**FORM_TEXT_DEFAULTS, **FORM_OTHER_DEFAULTS}.items():
-    if key not in st.session_state:
-        st.session_state[key] = default
+"""
+WHEEL_JS = r"""
+export default function(component) {
+  const { parentElement, data, setStateValue } = component;
+  const root = parentElement.querySelector('.brix-input-panel');
+  if (!root) return;
+  const resetToken = String(data?.resetToken ?? 0);
+  const rowsRoot = root.querySelector('.brix-measurement-rows');
+  const targetSelect = root.querySelector('.brix-target-select');
+  const columnsRoot = root.querySelector('.brix-wheel-columns');
+  const readout = root.querySelector('.brix-wheel-readout');
+  const rowHeight = 28;
+  const columns = [
+    {key:'integer', label:'整数部', values:Array.from({length:51},(_,i)=>i)},
+    {key:'tenths', label:'小数第1位', values:Array.from({length:10},(_,i)=>i)},
+    {key:'hundredths', label:'小数第2位', values:Array.from({length:10},(_,i)=>i)}
+  ];
+  const clamp = (n, lo, hi) => Math.max(lo, Math.min(hi, n));
+  const normalizeState = (raw) => ({
+    values: Array.from({length:6},(_,i)=>String(raw?.values?.[i] ?? '')),
+    enabled: Array.from({length:6},(_,i)=>Boolean(raw?.enabled?.[i])),
+    target: clamp(Number(raw?.target ?? 1) || 1,1,6)
+  });
+  const stateSignature = raw => JSON.stringify(normalizeState(raw));
 
-for i in range(1, 7):
-    st.session_state.setdefault(f"chk_m{i}", False)
-    st.session_state.setdefault(f"val_m{i}", 0.0)
+  function build(initialRaw) {
+    rowsRoot.replaceChildren();
+    columnsRoot.replaceChildren();
+    let state = normalizeState(initialRaw);
+    const inputEls = [];
+    const checkEls = [];
+    const wheels = {};
+    const suppressUntil = {};
+    let sendTimer = null;
 
-NUMERIC_FORM_DEFAULTS = {
-    "chk_alc": False, "val_alc": 15.0,
-    "chk_smv": False, "val_smv": 0.0,
-    "chk_acid": False, "val_acid": 1.3,
-    "chk_amino": False, "val_amino": 1.1,
-    "chk_rp": False, "val_rp": 60.0,
+    function payload() {
+      return {
+        values: inputEls.map(input=>input.value),
+        enabled: checkEls.map(check=>check.checked),
+        target: Number(targetSelect.value) || 1
+      };
+    }
+    function sendState(immediate=false) {
+      if (sendTimer) { clearTimeout(sendTimer); sendTimer=null; }
+      const next = payload();
+      const sig = stateSignature(next);
+      if (root.dataset.lastSentState === sig) return;
+      const publish = () => {
+        root.dataset.lastSentState = sig;
+        setStateValue('value', next);
+      };
+      if (immediate) publish();
+      else sendTimer = setTimeout(publish, 100);
+    }
+    function activeIndex(wheel, idx) {
+      wheel.querySelectorAll('.brix-wheel-option').forEach((el,i)=>{
+        const active = i === idx;
+        el.classList.toggle('is-active', active);
+        el.setAttribute('aria-selected', active ? 'true' : 'false');
+      });
+    }
+    function move(key, idx) {
+      const wheel = wheels[key];
+      if (!wheel) return;
+      idx = clamp(idx,0,wheel.querySelectorAll('.brix-wheel-option').length - 1);
+      suppressUntil[key] = Date.now() + 200;
+      wheel.scrollTop = idx * rowHeight;
+      activeIndex(wheel,idx);
+    }
+    function selectedIndex(wheel) {
+      return clamp(Math.round(wheel.scrollTop / rowHeight),0,wheel.querySelectorAll('.brix-wheel-option').length - 1);
+    }
+    function parseValue(raw) {
+      const text = String(raw ?? '').trim().replace('，','.');
+      if (!text) return null;
+      let value;
+      if (/^\d{1,2}(?:\.\d{0,2})?$/.test(text)) value = Number(text);
+      else if (/^\d{1,2},\d{1,2}$/.test(text)) value = Number(text.replace(',','.'));
+      else return null;
+      if (!Number.isFinite(value) || value < 0 || value > 50) return null;
+      if (value === 50 && /[.,]\d*[1-9]/.test(text)) return null;
+      return Number(value.toFixed(2));
+    }
+    function currentWheelValue(digits) {
+      if (Object.values(digits).some(v=>v===null)) return null;
+      const cents = digits.integer*100 + digits.tenths*10 + digits.hundredths;
+      return cents <= 5000 ? Number((cents/100).toFixed(2)) : null;
+    }
+    const digits = {integer:null, tenths:null, hundredths:null};
+    function renderValue() {
+      const value = currentWheelValue(digits);
+      readout.textContent = value === null ? '未選択' : value.toFixed(2) + ' °Bx';
+      return value;
+    }
+    function setDigitsFromValue(value) {
+      if (value === null || value === undefined || value === '') {
+        digits.integer=null; digits.tenths=null; digits.hundredths=null;
+      } else {
+        const n = Number(value);
+        if (!Number.isFinite(n) || n<0 || n>50) return;
+        const cents = Math.round(n*100);
+        digits.integer=Math.floor(cents/100);
+        digits.tenths=Math.floor((cents%100)/10);
+        digits.hundredths=cents%10;
+      }
+      columns.forEach(({key})=>move(key,digits[key]===null?0:digits[key]+1));
+      renderValue();
+    }
+    function refreshWheelFromTarget() {
+      const target = Number(targetSelect.value) || 1;
+      setDigitsFromValue(parseValue(inputEls[target-1].value));
+    }
+    function choose(key, idx, fromScroll=false) {
+      const wheel=wheels[key]; if(!wheel) return;
+      idx=clamp(idx,0,wheel.querySelectorAll('.brix-wheel-option').length-1);
+      const val=idx===0?null:idx-1;
+      digits[key]=val;
+      if(key==='integer' && val===50) {
+        digits.tenths=0; digits.hundredths=0;
+        move('tenths',1); move('hundredths',1);
+      } else if(key==='integer' && val!==null) {
+        if(digits.tenths===null) {digits.tenths=0;move('tenths',1);}
+        if(digits.hundredths===null) {digits.hundredths=0;move('hundredths',1);}
+      }
+      if(digits.integer===50 && (key==='tenths'||key==='hundredths') && val!==null && val!==0) {
+        digits[key]=0; move(key,1);
+      }
+      if(!fromScroll) move(key,digits[key]===null?0:digits[key]+1);
+      const value=renderValue();
+      const target=Number(targetSelect.value)-1;
+      const input=inputEls[target];
+      if(value===null) {
+        input.value='';
+        checkEls[target].checked=false;
+      } else {
+        input.value=value.toFixed(2);
+        checkEls[target].checked=true;
+      }
+      sendState(true);
+    }
+
+    for(let i=0;i<6;i++) {
+      const row=document.createElement('div'); row.className='brix-measurement-row';
+      const label=document.createElement('label'); label.className='brix-row-check';
+      const check=document.createElement('input'); check.type='checkbox'; check.checked=state.enabled[i];
+      check.setAttribute('aria-label',`測定${i+1}を保存対象にする`);
+      const labelText=document.createElement('span'); labelText.textContent=`測定${i+1}を保存`;
+      label.append(check,labelText);
+      const input=document.createElement('input'); input.type='text'; input.inputMode='decimal'; input.autocomplete='off'; input.autocapitalize='off'; input.spellcheck=false; input.maxLength=6;
+      input.className='brix-row-input'; input.value=state.values[i]; input.placeholder='例：8.45'; input.setAttribute('aria-label',`測定${i+1}の糖度（°Bx）`);
+      check.addEventListener('change',()=>sendState(true));
+      input.addEventListener('input',()=>{
+        if(Number(targetSelect.value)===i+1) refreshWheelFromTarget();
+        sendState(false);
+      });
+      input.addEventListener('change',()=>{
+        if(input.value.trim() && parseValue(input.value)!==null) check.checked=true;
+        sendState(true);
+      });
+      input.addEventListener('blur',()=>{
+        if(input.value.trim() && parseValue(input.value)!==null) check.checked=true;
+        sendState(true);
+      });
+      input.addEventListener('keydown',(event)=>{
+        if(event.key==='Enter') {event.preventDefault(); input.blur();}
+      });
+      inputEls.push(input); checkEls.push(check); row.append(label,input); rowsRoot.appendChild(row);
+    }
+    targetSelect.value=String(state.target);
+    targetSelect.addEventListener('change',()=>{refreshWheelFromTarget();sendState(true);});
+
+    columns.forEach(({key,label,values})=>{
+      const part=document.createElement('div'); part.className='brix-wheel-part';
+      const title=document.createElement('div'); title.className='brix-wheel-part-label'; title.textContent=label;
+      const wheel=document.createElement('div'); wheel.className='brix-wheel-column'; wheel.setAttribute('role','listbox'); wheel.setAttribute('aria-label',label); wheel.tabIndex=0;
+      const list=document.createElement('div'); list.className='brix-wheel-list';
+      [null,...values].forEach((value,index)=>{
+        const option=document.createElement('button'); option.type='button'; option.className='brix-wheel-option';
+        option.textContent=value===null?'—':String(value); option.setAttribute('role','option'); option.setAttribute('aria-selected','false');
+        option.addEventListener('click',()=>{move(key,index);choose(key,index,true);});
+        list.appendChild(option);
+      });
+      wheel.appendChild(list); wheels[key]=wheel;
+      let timer=null;
+      wheel.addEventListener('scroll',()=>{
+        if(Date.now()<(suppressUntil[key]||0)) return;
+        if(timer) clearTimeout(timer);
+        timer=setTimeout(()=>{const idx=selectedIndex(wheel);move(key,idx);choose(key,idx,true);},80);
+      },{passive:true});
+      wheel.addEventListener('keydown',(event)=>{
+        if(!['ArrowUp','ArrowDown','Home','End'].includes(event.key)) return;
+        event.preventDefault();
+        if(event.key==='Home') choose(key,0);
+        else if(event.key==='End') choose(key,wheel.querySelectorAll('.brix-wheel-option').length-1);
+        else choose(key,selectedIndex(wheel)+(event.key==='ArrowDown'?1:-1));
+      });
+      part.append(title,wheel); columnsRoot.appendChild(part); activeIndex(wheel,0);
+    });
+    refreshWheelFromTarget();
+    root.dataset.lastSentState=stateSignature(payload());
+  }
+
+  const incoming = normalizeIncoming(data?.initialState);
+  function normalizeIncoming(raw) {
+    return {
+      values: Array.from({length:6},(_,i)=>String(raw?.values?.[i] ?? '')),
+      enabled: Array.from({length:6},(_,i)=>Boolean(raw?.enabled?.[i])),
+      target: Math.max(1,Math.min(6,Number(raw?.target ?? 1)||1))
+    };
+  }
+  if(root.dataset.built!=='true' || root.dataset.resetToken!==resetToken) {
+    root.dataset.built='true'; root.dataset.resetToken=resetToken;
+    build(incoming);
+  } else {
+    // Only replace browser input state when Python changed it independently.
+    const signature=JSON.stringify(incoming);
+    if(root.dataset.lastServerState!==signature && root.dataset.lastSentState!==signature) {
+      root.dataset.lastServerState=signature;
+      build(incoming);
+    }
+  }
+  root.dataset.lastServerState=JSON.stringify(incoming);
 }
-for key, default in NUMERIC_FORM_DEFAULTS.items():
-    st.session_state.setdefault(key, default)
+"""
 
 
-def _clean_text(value) -> str:
-    if value is None:
-        return ""
-    return str(value).strip()
-
-
-def _candidate_float(value):
-    if value is None or value == "":
-        return None
-    try:
-        result = float(value)
-        return result if pd.notna(result) else None
-    except (TypeError, ValueError):
-        return None
-
-
-def set_form_from_candidate(candidate: dict) -> None:
-    """Set real widget keys before widgets are rendered for the current run."""
-    text_map = {
-        "input_brewery": "brewery",
-        "input_name": "name",
-        "input_by": "by_year",
-        "input_lot": "lot_date",
-        "input_state": "processing_state",
-        "input_rice": "rice_used",
-        "input_yeast": "yeast",
-    }
-    for widget_key, candidate_key in text_map.items():
-        st.session_state[widget_key] = _clean_text(candidate.get(candidate_key))
-
-    category = _clean_text(candidate.get("spec_category"))
-    st.session_state["input_spec"] = category if category in SPEC_OPTIONS else ("その他" if category else "未選択")
-
-    numeric_map = {
-        "alcohol": ("chk_alc", "val_alc", 15.0, 0.0, 30.0),
-        "smv": ("chk_smv", "val_smv", 0.0, -30.0, 30.0),
-        "acidity": ("chk_acid", "val_acid", 1.3, 0.0, 5.0),
-        "amino_acid": ("chk_amino", "val_amino", 1.1, 0.0, 5.0),
-        "rice_polished": ("chk_rp", "val_rp", 60.0, 0.0, 100.0),
-    }
-    for candidate_key, (check_key, value_key, default_value, minimum, maximum) in numeric_map.items():
-        value = _candidate_float(candidate.get(candidate_key))
-        if value is not None and not minimum <= value <= maximum:
-            value = None  # Ignore implausible AI readings instead of breaking a number_input.
-        st.session_state[check_key] = value is not None
-        st.session_state[value_key] = value if value is not None else default_value
-
-
-def apply_selected_candidate_callback() -> None:
-    candidates = st.session_state.get("ai_candidates", [])
-    index = st.session_state.get("candidate_select_box", 0)
-    if not candidates:
-        st.session_state["selected_candidate"] = {}
-        return
-    try:
-        index = int(index)
-    except (TypeError, ValueError):
-        index = 0
-    index = min(max(index, 0), len(candidates) - 1)
-    selected = candidates[index]
-    st.session_state["selected_candidate"] = selected
-    set_form_from_candidate(selected)
-    st.session_state["db_notice"] = None
-    st.session_state["candidate_apply_notice"] = f"候補 {index + 1} をフォームへ反映しました。内容を確認してください。"
-
-
-def reset_entry_form_state() -> None:
-    """Called from the submit callback before widgets are recreated.
-
-    Notice keys are intentionally not reset here; the success/error message
-    must survive into the next render.
-    """
-    for key, default in FORM_TEXT_DEFAULTS.items():
-        st.session_state[key] = default
-    st.session_state["input_spec"] = "未選択"
-    st.session_state["candidate_select_box"] = 0
-    st.session_state["selected_candidate"] = {}
-    st.session_state["ai_candidates"] = []
-    st.session_state["current_image_hash"] = None
-    st.session_state["last_inference_time"] = None
-    for i in range(1, 7):
-        st.session_state[f"chk_m{i}"] = False
-        st.session_state[f"val_m{i}"] = 0.0
-    for key, default in NUMERIC_FORM_DEFAULTS.items():
-        st.session_state[key] = default
-
-
-def save_new_record_callback() -> None:
-    """Read submitted form values, save atomically, and reset only on success."""
-    brewery = _clean_text(st.session_state.get("input_brewery"))
-    name = _clean_text(st.session_state.get("input_name"))
-    if not brewery or not name:
-        st.session_state["save_notice"] = ("error", "蔵元名と銘柄名は必須です。入力値は保持されています。")
-        return
-
-    measurements: list[float | None] = []
-    try:
-        for i in range(1, 7):
-            if st.session_state.get(f"chk_m{i}", False):
-                value = float(st.session_state.get(f"val_m{i}", 0.0))
-                if not 0.0 <= value <= 50.0:
-                    raise ValueError(f"測定{i}の糖度は0.00〜50.00の範囲で入力してください。")
-                measurements.append(value)
-            else:
-                measurements.append(None)
-        stats = calculate_statistics(measurements)
-    except Exception as exc:
-        st.session_state["save_notice"] = ("error", f"糖度測定値を確認してください: {exc} 入力値は保持されています。")
-        return
-
-    optional_values = {
-        "alcohol": float(st.session_state["val_alc"]) if st.session_state.get("chk_alc") else None,
-        "smv": float(st.session_state["val_smv"]) if st.session_state.get("chk_smv") else None,
-        "acidity": float(st.session_state["val_acid"]) if st.session_state.get("chk_acid") else None,
-        "amino_acid": float(st.session_state["val_amino"]) if st.session_state.get("chk_amino") else None,
-        "rice_polished": float(st.session_state["val_rp"]) if st.session_state.get("chk_rp") else None,
-    }
-    # Avoid saving out-of-range values even if state was modified outside widgets.
-    limits = {
-        "alcohol": (0, 30), "smv": (-30, 30), "acidity": (0, 5),
-        "amino_acid": (0, 5), "rice_polished": (0, 100),
-    }
-    for field, value in optional_values.items():
-        if value is not None and not limits[field][0] <= value <= limits[field][1]:
-            st.session_state["save_notice"] = ("error", f"{field} の入力値が許容範囲外です。入力値は保持されています。")
-            return
-
-    record = {
-        "id": str(uuid.uuid4()),
-        "recorded_at": get_jst_now(),
-        "brewery": brewery,
-        "name": name,
-        "by_year": _clean_text(st.session_state.get("input_by")) or None,
-        "lot_date": _clean_text(st.session_state.get("input_lot")) or None,
-        "spec_category": st.session_state.get("input_spec", "未選択"),
-        "processing_state": _clean_text(st.session_state.get("input_state")) or None,
-        "brix": stats["brix"],
-        **{f"m{i}": measurements[i - 1] for i in range(1, 7)},
-        **stats,
-        **optional_values,
-        "rice_used": _clean_text(st.session_state.get("input_rice")) or None,
-        "yeast": _clean_text(st.session_state.get("input_yeast")) or None,
-        "memo": _clean_text(st.session_state.get("input_memo")) or None,
-    }
-    try:
-        saved_id = save_measurement(DB_NAME, record)
-        st.session_state["save_notice"] = (
-            "success",
-            f"保存しました: {brewery} — {name} / 平均糖度 {stats['mean']:.2f}°Bx (ID: {saved_id[:8]}…)" ,
-        )
-        # The callback runs before the new render, so assigning widget keys here is safe.
-        reset_entry_form_state()
-    except Exception as exc:
-        st.session_state["save_notice"] = ("error", f"保存に失敗しました: {exc} 入力値は保持されています。")
-
-
-
-
-def delete_record_callback() -> None:
-    record_id = st.session_state.get("selected_record_id")
-    if not record_id:
-        st.session_state["db_notice"] = ("error", "削除対象が選択されていません。")
-        return
-    conn = connect_db(DB_NAME)
-    try:
-        conn.execute("BEGIN IMMEDIATE")
-        cursor = conn.execute("DELETE FROM measurements WHERE id = ?", (record_id,))
-        if cursor.rowcount != 1:
-            raise RuntimeError("対象レコードが見つからないか、すでに削除されています。")
-        conn.commit()
-        st.session_state["db_notice"] = ("success", "レコードを削除しました。")
-        st.session_state["confirm_delete_record"] = False
-        st.session_state["selected_record_id"] = ""
-    except Exception as exc:
-        conn.rollback()
-        st.session_state["db_notice"] = ("error", f"削除エラー: {exc}")
-    finally:
-        conn.close()
-
-
-# -----------------------------------------------------------------------------
-# Sidebar: AI settings and JSON backup
-# -----------------------------------------------------------------------------
-def get_secret(name: str, fallback=None):
-    try:
-        return st.secrets.get(name, fallback)
-    except Exception:
-        return fallback
-
-if "api_key_input" not in st.session_state:
-    st.session_state["api_key_input"] = get_secret("GEMINI_API_KEY", "") or ""
-if "model_name_input" not in st.session_state:
-    st.session_state["model_name_input"] = get_secret("GEMINI_MODEL", MODEL_DEFAULT) or MODEL_DEFAULT
-
-st.sidebar.title("⚙️ 設定・API管理")
-api_key = st.sidebar.text_input("Gemini API Key", type="password", key="api_key_input", placeholder="APIキーを入力")
-model_name = st.sidebar.text_input("Geminiモデル名", key="model_name_input", help="利用可能なモデル名を指定してください。")
-
-client = None
-if not GENAI_AVAILABLE:
-    st.sidebar.warning("google-genai がインストールされていないため、AI解析は無効です。手入力・DB機能は利用できます。")
-elif _clean_text(api_key):
-    try:
-        client = genai.Client(api_key=_clean_text(api_key))
-        st.sidebar.caption("APIクライアントを初期化しました。通信成功は接続テストで確認してください。")
-    except Exception as exc:
-        st.sidebar.error(f"APIクライアント初期化エラー: {exc}")
-else:
-    st.sidebar.info("Secrets またはサイドバーからAPIキーを設定してください。")
-
-if st.sidebar.button("🔌 API接続テスト", key="api_connection_test"):
-    if client is None:
-        st.sidebar.error("APIキーまたは google-genai SDK が利用できません。")
-    else:
-        try:
-            with st.spinner("APIへ接続しています…"):
-                client.models.generate_content(model=_clean_text(model_name) or MODEL_DEFAULT, contents="Reply with OK.")
-            st.sidebar.success(f"API通信成功 ({get_jst_now()})")
-        except Exception as exc:
-            st.sidebar.error(f"API通信に失敗しました: {exc}")
-
-st.sidebar.markdown("---")
-st.sidebar.subheader("📦 データバックアップ")
-try:
-    export_payload = json.dumps(export_records(DB_NAME), ensure_ascii=False, indent=2, allow_nan=False)
-    st.sidebar.download_button(
-        "💾 JSONバックアップをダウンロード",
-        data=export_payload.encode("utf-8"),
-        file_name=f"sake_brix_backup_{time.strftime('%Y%m%d')}.json",
-        mime="application/json",
-        key="download_json_backup",
-    )
-except Exception as exc:
-    st.sidebar.error(f"JSONバックアップの作成に失敗しました: {exc}")
-
-# -----------------------------------------------------------------------------
-# Main navigation
-# -----------------------------------------------------------------------------
-st.title("🍶 日本酒 糖度測定＆総合スペック管理ツール")
-menu = st.radio(
-    "メニュー",
-    ["📝 新規測定・入力", "📊 保存データ一覧・検索・編集", "⚖️ データ比較", "🔄 バックアップ・復元"],
-    horizontal=True,
-    key="main_menu",
+brix_measurement_input = component(
+    name="sake_brix_compact_measurements_v1",
+    html=WHEEL_HTML,
+    css=WHEEL_CSS,
+    js=WHEEL_JS,
 )
 
-# -----------------------------------------------------------------------------
-# Screen 1: entry + image analysis
-# -----------------------------------------------------------------------------
-if menu == "📝 新規測定・入力":
-    st.header("📝 新規測定・スペック入力")
 
-    notice = st.session_state.pop("save_notice", None)
-    if notice:
-        (st.success if notice[0] == "success" else st.error)(notice[1])
-    candidate_notice = st.session_state.pop("candidate_apply_notice", None)
-    if candidate_notice:
-        st.success(candidate_notice)
+def get_secret(name: str, default: str = "") -> str:
+    try:
+        value = st.secrets.get(name, default)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    except Exception:
+        pass
+    return os.getenv(name, default).strip()
 
-    with st.expander("📷 ラベル撮影・画像アップロード（AI自動解析）", expanded=True):
-        st.write("スマートフォンのカメラ撮影、またはフォトライブラリからラベル画像を選択してください。")
-        uploaded_image = st.file_uploader(
-            "ラベル画像 (JPEG / PNG)", type=["jpg", "jpeg", "png"], key="label_image"
+
+def get_database_url() -> str:
+    return get_secret("DATABASE_URL")
+
+
+def get_gemini_key() -> str:
+    value = st.session_state.get("gemini_key", "")
+    return str(value).strip() if value else get_secret("GEMINI_API_KEY")
+
+
+def get_gemini_model() -> str:
+    value = st.session_state.get("gemini_model", "")
+    return str(value).strip() if value else get_secret("GEMINI_MODEL", "gemini-3.8-flash")
+
+
+def get_gemini_search_model() -> str:
+    """Separate search-grounding model from image/spec extraction model."""
+    value = st.session_state.get("gemini_search_model", "")
+    return str(value).strip() if value else get_secret("GEMINI_SEARCH_MODEL", DEFAULT_SEARCH_MODEL)
+
+
+def component_state_value(component_key: str) -> Any:
+    result = st.session_state.get(component_key)
+    if result is None:
+        return None
+    value = getattr(result, "value", None)
+    if value is None and isinstance(result, dict):
+        value = result.get("value")
+    return value
+
+
+def normalize_measurement_ui_state(raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        raw = {}
+    values = raw.get("values") if isinstance(raw.get("values"), list) else []
+    enabled = raw.get("enabled") if isinstance(raw.get("enabled"), list) else []
+    try:
+        target = max(1, min(6, int(raw.get("target", 1))))
+    except (TypeError, ValueError):
+        target = 1
+    return {
+        "values": [str(values[i] if i < len(values) and values[i] is not None else "") for i in range(6)],
+        "enabled": [bool(enabled[i]) if i < len(enabled) else False for i in range(6)],
+        "target": target,
+    }
+
+
+def sync_compact_measurements() -> None:
+    reset_token = int(st.session_state.get("wheel_reset_token", 0))
+    component_key = f"brix_measurements_{reset_token}"
+    payload = component_state_value(component_key)
+    if isinstance(payload, dict):
+        st.session_state["compact_measurements"] = normalize_measurement_ui_state(payload)
+
+
+def initialise_form_state() -> None:
+    defaults = {
+        "f_brewery": "", "f_name": "", "f_name_kana": "", "f_brewery_kana": "", "f_name_aliases": "",
+        "f_reading_confirmed": False, "f_by_year": "", "f_lot_date": "",
+        "f_spec_category": "未選択", "f_processing_state": "", "f_rice_used": "", "f_yeast": "", "f_memo": "",
+        "f_alcohol": "", "f_smv": "", "f_acidity": "", "f_amino_acid": "", "f_rice_polished": "",
+        "has_alcohol": False, "has_smv": False, "has_acidity": False, "has_amino_acid": False, "has_rice_polished": False,
+        "draft_sources": [], "auto_filled_values": {}, "wheel_reset_token": 0, "flash_message": "", "flash_type": "success",
+        "compact_measurements": {"values": [""] * 6, "enabled": [False] * 6, "target": 1},
+        "local_name_candidates": [], "search_cache_note": "", "auto_filled_fields": [],
+        "label_candidates": [], "selected_label_idx": 0, "search_candidates": [], "search_notes": [],
+        "grounding_sources": [], "search_query": "", "selected_search_idx": 0, "last_search_key": "",
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+def set_flash(message: str, kind: str = "success") -> None:
+    st.session_state["flash_message"] = message
+    st.session_state["flash_type"] = kind
+
+
+def _apply_candidate_values(candidate: dict[str, Any], source_ref: dict[str, Any] | None = None, *, origin: str = "external") -> None:
+    """Apply one selected candidate without overwriting sugar measurements.
+
+    Values auto-filled from a previously selected candidate are cleared only if the user
+    has not changed them since. Manual edits therefore survive a candidate switch.
+    """
+    field_to_state = {
+        "brewery": "f_brewery", "name": "f_name", "name_kana": "f_name_kana",
+        "brewery_kana": "f_brewery_kana", "by_year": "f_by_year", "lot_date": "f_lot_date",
+        "spec_category": "f_spec_category", "processing_state": "f_processing_state",
+        "rice_used": "f_rice_used", "yeast": "f_yeast", "name_aliases": "f_name_aliases", "alcohol": "f_alcohol",
+        "smv": "f_smv", "acidity": "f_acidity", "amino_acid": "f_amino_acid",
+        "rice_polished": "f_rice_polished",
+    }
+    numeric_fields = set(NUMERIC_SPEC_FIELDS)
+    previous = st.session_state.get("auto_filled_values", {})
+    if not isinstance(previous, dict):
+        previous = {}
+    # Clear stale values inserted by the previous candidate. If the user changed one,
+    # treat it as a manual edit and keep it.
+    for field, old_value in previous.items():
+        state_key = field_to_state.get(field)
+        if not state_key:
+            continue
+        current_value = st.session_state.get(state_key)
+        if str(current_value) == str(old_value):
+            if field in numeric_fields:
+                st.session_state[state_key] = ""
+                st.session_state[f"has_{field}"] = False
+            elif field == "spec_category":
+                st.session_state[state_key] = "未選択"
+            else:
+                st.session_state[state_key] = ""
+    st.session_state["auto_filled_values"] = {}
+
+    candidate_name = candidate.get("name") or candidate.get("product_name")
+    value_sources: dict[str, Any] = {
+        "brewery": candidate.get("brewery"),
+        "name": candidate_name,
+        "name_kana": normalize_kana(candidate.get("name_kana")),
+        "brewery_kana": normalize_kana(candidate.get("brewery_kana")),
+        "by_year": candidate.get("by_year"),
+        "lot_date": candidate.get("lot_date"),
+        "spec_category": candidate.get("spec_category"),
+        "processing_state": candidate.get("processing_state"),
+        "rice_used": candidate.get("rice_used"),
+        "yeast": candidate.get("yeast"),
+    }
+    newly_filled: dict[str, Any] = {}
+    for field, value in value_sources.items():
+        if value is None or not str(value).strip():
+            continue
+        state_key = field_to_state[field]
+        normalized_value = str(value).strip()
+        st.session_state[state_key] = normalized_value
+        newly_filled[field] = normalized_value
+
+    numeric_ranges = {
+        "alcohol": (0.0, 30.0), "smv": (-30.0, 30.0), "acidity": (0.0, 5.0),
+        "amino_acid": (0.0, 5.0), "rice_polished": (0.0, 100.0),
+    }
+    for field in NUMERIC_SPEC_FIELDS:
+        value = candidate.get(field)
+        if value is None:
+            continue
+        try:
+            numeric_value = float(value)
+        except (ValueError, TypeError):
+            continue
+        low, high = numeric_ranges[field]
+        if not (low <= numeric_value <= high):
+            # Ignore impossible/out-of-range values from an AI or external source.
+            continue
+        st.session_state[f"has_{field}"] = True
+        st.session_state[f"f_{field}"] = format(numeric_value, "g")
+        newly_filled[field] = format(numeric_value, "g")
+
+    aliases = candidate.get("name_aliases")
+    if isinstance(aliases, list) and aliases:
+        alias_text = "、".join(str(x) for x in aliases)
+        st.session_state["f_name_aliases"] = alias_text
+        newly_filled["name_aliases"] = alias_text
+
+    # A found reading is still unconfirmed unless it came from a user-confirmed local record.
+    # Never carry a previous candidate's confirmation checkbox into a candidate
+    # that has no reading. Only a previously confirmed local record may pre-check it.
+    st.session_state["f_reading_confirmed"] = bool(
+        value_sources.get("name_kana")
+        and origin == "local"
+        and candidate.get("reading_status") == "confirmed"
+    )
+    st.session_state["auto_filled_values"] = newly_filled
+
+    if source_ref:
+        sources = list(st.session_state.get("draft_sources", []))
+        if not any(s.get("url") == source_ref.get("url") and s.get("source_name") == source_ref.get("source_name") for s in sources):
+            sources.append(source_ref)
+        st.session_state["draft_sources"] = sources
+    elif origin == "local":
+        for src in candidate.get("info_sources") or []:
+            if isinstance(src, dict) and src not in st.session_state.get("draft_sources", []):
+                st.session_state["draft_sources"].append(src)
+
+    if origin == "local":
+        set_flash("登録済みの銘柄候補を反映しました。糖度の実測値は変更していません。", "info")
+    elif origin == "label":
+        set_flash("ラベル解析候補を反映しました。読み方・スペックをラベルと照合してください。", "info")
+    else:
+        set_flash("検索候補の掲載項目を反映しました。読み仮名は未確認状態です。値と出典を確認して保存してください。", "info")
+
+
+def apply_search_candidate(index: int) -> None:
+    candidates = st.session_state.get("search_candidates", [])
+    if not isinstance(candidates, list) or index < 0 or index >= len(candidates):
+        set_flash("検索候補が見つかりません。再検索してください。", "error")
+        return
+    candidate = candidates[index]
+    if candidate.get("source_id") == "local":
+        _apply_candidate_values(candidate, None, origin="local")
+        return
+    source_ref = {
+        "source_name": candidate.get("source_name", "外部検索"),
+        "url": candidate.get("source_url"),
+        "retrieved_at": datetime.now(timezone.utc).isoformat(),
+        "product_name": candidate.get("product_name") or candidate.get("name"),
+        "fields_reported_by_ai": candidate.get("fields_reported_by_ai", []),
+        "url_verified_by_grounding": bool(candidate.get("url_verified_by_grounding")),
+    }
+    _apply_candidate_values(candidate, source_ref, origin="external")
+
+
+def apply_label_candidate() -> None:
+    candidates = st.session_state.get("label_candidates", [])
+    index = int(st.session_state.get("selected_label_idx", 0))
+    if isinstance(candidates, list) and 0 <= index < len(candidates):
+        _apply_candidate_values(candidates[index], None, origin="label")
+
+
+def reset_form_state() -> None:
+    for key in ["f_brewery", "f_name", "f_name_kana", "f_brewery_kana", "f_name_aliases", "f_by_year", "f_lot_date", "f_processing_state", "f_rice_used", "f_yeast", "f_memo"]:
+        st.session_state[key] = ""
+    st.session_state["f_spec_category"] = "未選択"
+    st.session_state["f_reading_confirmed"] = False
+    for field in NUMERIC_SPEC_FIELDS:
+        st.session_state[f"f_{field}"] = ""
+        st.session_state[f"has_{field}"] = False
+    st.session_state["compact_measurements"] = {"values": [""] * 6, "enabled": [False] * 6, "target": 1}
+    st.session_state["wheel_reset_token"] = int(st.session_state.get("wheel_reset_token", 0)) + 1
+    st.session_state["draft_sources"] = []
+    st.session_state["auto_filled_values"] = {}
+    st.session_state["label_candidates"] = []
+    st.session_state["search_candidates"] = []
+    st.session_state["local_name_candidates"] = []
+    st.session_state["search_notes"] = []
+    st.session_state["selected_label_idx"] = 0
+    set_flash("保存しました。次の銘柄を入力できます。")
+
+
+def save_current_measurement(database_url: str) -> None:
+    try:
+        raw: dict[str, Any] = {
+            "brewery": st.session_state.get("f_brewery", ""),
+            "name": st.session_state.get("f_name", ""),
+            "name_kana": st.session_state.get("f_name_kana", ""),
+            "brewery_kana": st.session_state.get("f_brewery_kana", ""),
+            "reading_confirmed": bool(st.session_state.get("f_reading_confirmed", False)),
+            "name_aliases": st.session_state.get("f_name_aliases", ""),
+            "by_year": st.session_state.get("f_by_year", ""),
+            "lot_date": st.session_state.get("f_lot_date", ""),
+            "spec_category": st.session_state.get("f_spec_category", "未選択"),
+            "processing_state": st.session_state.get("f_processing_state", ""),
+            "rice_used": st.session_state.get("f_rice_used", ""),
+            "yeast": st.session_state.get("f_yeast", ""),
+            "memo": st.session_state.get("f_memo", ""),
+            "info_sources": list(st.session_state.get("draft_sources", [])),
+        }
+        measurement_state = normalize_measurement_ui_state(st.session_state.get("compact_measurements", {}))
+        for i in range(1, 7):
+            enabled = bool(measurement_state["enabled"][i - 1])
+            text_value = str(measurement_state["values"][i - 1]).strip()
+            if enabled and not text_value:
+                raise ValueError(f"測定{i}が保存対象ですが、糖度が空欄です。直接入力するか、対象を外してください。")
+            if enabled:
+                normalized = text_value.replace("，", ".")
+                if "," in normalized and "." not in normalized and normalized.count(",") == 1:
+                    normalized = normalized.replace(",", ".")
+                try:
+                    decimal_value = Decimal(normalized)
+                except InvalidOperation as exc:
+                    raise ValueError(f"測定{i}は0.00〜50.00の数値で入力してください。") from exc
+                if not decimal_value.is_finite() or decimal_value < 0 or decimal_value > 50:
+                    raise ValueError(f"測定{i}は0.00〜50.00の範囲で入力してください。")
+                if decimal_value.as_tuple().exponent < -2:
+                    raise ValueError(f"測定{i}は小数第2位まで入力してください。")
+                raw[f"m{i}"] = normalized
+            else:
+                raw[f"m{i}"] = None
+        for field in NUMERIC_SPEC_FIELDS:
+            raw[f"has_{field}"] = bool(st.session_state.get(f"has_{field}", False))
+            raw[field] = st.session_state.get(f"f_{field}")
+        insert_measurement(database_url, raw)
+        reset_form_state()
+    except Exception as exc:
+        set_flash(f"保存できませんでした。入力値は保持しています。詳細: {exc}", "error")
+
+
+def run_label_scan(api_key: str, model: str, image_bytes: bytes, mime_type: str) -> list[dict[str, Any]]:
+    from google import genai
+    from google.genai import types
+    client = genai.Client(api_key=api_key)
+    prompt = """画像内の日本酒ラベルを読んでください。複数本なら個別に抽出。
+銘柄・蔵元名、銘柄名の読み（ひらがな。根拠がなければnull）、特定名称、製法状態、醸造年度、製造年月/ロット、アルコール度数、日本酒度、酸度、アミノ酸度、精米歩合、使用米、酵母を抽出します。
+明記されていない項目はnull。推測しない。画像上のラベルに見える数値を、別商品や別年度から補完しないでください。"""
+    response = client.models.generate_content(
+        model=model,
+        contents=[types.Part.from_bytes(data=image_bytes, mime_type=mime_type), prompt],
+        config=types.GenerateContentConfig(response_mime_type="application/json", response_schema=LabelScanResponse),
+    )
+    parsed = getattr(response, "parsed", None)
+    if isinstance(parsed, LabelScanResponse):
+        result = parsed
+    elif parsed is not None and hasattr(parsed, "model_dump"):
+        result = LabelScanResponse.model_validate(parsed.model_dump())
+    else:
+        result = LabelScanResponse.model_validate_json(response.text)
+    return [item.model_dump(mode="json") for item in result.labels if item.brewery or item.name]
+
+
+def render_source_search(database_url: str) -> None:
+    with st.expander("🔎 銘柄情報を複数の情報源から検索（ひらがな対応）", expanded=False):
+        st.write(
+            "登録済みデータは即時検索できます。外部検索は2つの使い方があります。"
+            "「サイト別リンク」は無料で即時表示、「AI外部検索」はGemini 2.5 Flashで候補を整理します。"
+            "AI検索は速度と無料枠保護のため一度に最大3情報源です。"
         )
-        if uploaded_image is not None:
-            image_bytes = uploaded_image.getvalue()
-            image_hash = hashlib.sha256(image_bytes).hexdigest()
-            if st.session_state.get("current_image_hash") != image_hash:
-                st.session_state["current_image_hash"] = image_hash
-                st.session_state["ai_candidates"] = []
-                st.session_state["selected_candidate"] = {}
-                st.session_state["candidate_select_box"] = 0
-                st.session_state["last_inference_time"] = None
-            st.image(image_bytes, caption="アップロードされたラベル", use_container_width=True)
+        labels = {source["name"]: source["id"] for source in SOURCE_REGISTRY}
+        default_sources = ["はせがわ酒店", "いまでや酒店", "佐野屋 JIZAKE.COM"]
+        selected_labels = st.multiselect(
+            "AI検索の対象（最大3つ）",
+            options=list(labels.keys()),
+            default=[label for label in default_sources if label in labels],
+            max_selections=3,
+            key="search_source_labels",
+            help="一度に選ぶ情報源を3つまでに絞ると、検索が速くなり、無料枠の消費も抑えられます。全店舗の直接検索リンクは下に表示します。",
+        )
+        query = st.text_input(
+            "銘柄名・読み仮名・蔵元名・商品特徴",
+            key="search_query",
+            placeholder="例：ほうおうびでん / 鳳凰美田",
+        )
+        if st.session_state.get("last_query_for_error") != query:
+            st.session_state["search_error"] = ""
+            st.session_state["last_query_for_error"] = query
+        force_search = st.checkbox(
+            "保存済み結果を使わずにAI外部検索を再実行する",
+            value=False,
+            key="force_search",
+        )
 
-            if st.button("🤖 このラベルをAIで解析する", key="analyze_label"):
-                if client is None:
-                    st.error("有効なGemini APIクライアントがありません。APIキーとSDKを確認してください。")
-                else:
-                    # JSON Schema follows the Python Gen AI SDK's JSON Schema option.
-                    nullable_string = {"anyOf": [{"type": "string"}, {"type": "null"}]}
-                    nullable_number = {"anyOf": [{"type": "number"}, {"type": "null"}]}
-                    response_schema = {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "brewery": nullable_string,
-                                "name": nullable_string,
-                                "spec_category": nullable_string,
-                                "processing_state": nullable_string,
-                                "by_year": nullable_string,
-                                "lot_date": nullable_string,
-                                "alcohol": nullable_number,
-                                "smv": nullable_number,
-                                "acidity": nullable_number,
-                                "amino_acid": nullable_number,
-                                "rice_polished": nullable_number,
-                                "rice_used": nullable_string,
-                                "yeast": nullable_string,
-                            },
-                            "required": [
-                                "brewery", "name", "spec_category", "processing_state", "by_year",
-                                "lot_date", "alcohol", "smv", "acidity", "amino_acid",
-                                "rice_polished", "rice_used", "yeast",
-                            ],
-                            "additionalProperties": False,
-                        },
-                    }
-                    prompt = (
-                        "画像に実際に写っている日本酒ラベルの情報を読み取ってください。"
-                        "画像にラベルが複数ある場合はラベルごとに個別のオブジェクトを返してください。"
-                        "不明または読み取れない項目はnullにしてください。推測で値を補わないでください。"
-                    )
-                    started = time.perf_counter()
+        # Always offer direct search links before any slower API call.
+        if query.strip():
+            with st.expander("⚡ 情報源別の直接検索（すぐ開く・Gemini API利用なし）", expanded=False):
+                st.caption(
+                    "この欄は検索リンクを作るだけなので待ち時間やGeminiの検索クォータを使いません。"
+                    "商品ページは別タブで確認し、年度・容量・生/火入れ・ロットを照合してください。"
+                )
+                link_sources = [source for source in SOURCE_REGISTRY if source["id"] in [labels.get(x) for x in selected_labels]]
+                # Other supported information sources remain immediately accessible too.
+                link_sources += [
+                    source for source in SOURCE_REGISTRY
+                    if source["id"] in {"katidoki", "hasegawa", "imadeya", "yamanaka", "sumiyoshi", "nobori", "sanoya", "kagiya", "yajima", "matsuzaki", "brewery", "sakenowa", "sakenowa_data", "sakeopendata", "sake_dataset"}
+                    and source not in link_sources
+                ]
+                cols = st.columns(2)
+                for idx, source in enumerate(link_sources):
                     try:
-                        try:
-                            config = types.GenerateContentConfig(
-                                response_mime_type="application/json",
-                                response_json_schema=response_schema,
-                                thinking_config=types.ThinkingConfig(thinking_level="low"),
-                            )
-                        except Exception:
-                            try:
-                                config = types.GenerateContentConfig(
-                                    response_mime_type="application/json",
-                                    response_json_schema=response_schema,
-                                )
-                            except Exception:
-                                try:
-                                    config = types.GenerateContentConfig(
-                                        response_mime_type="application/json",
-                                        response_schema=response_schema,
-                                    )
-                                except Exception:
-                                    config = types.GenerateContentConfig(response_mime_type="application/json")
-                                    st.warning("使用中のSDKがJSON Schema設定に対応していないため、JSON形式指定のみで解析します。google-genaiを更新してください。")
-                        response = client.models.generate_content(
-                            model=_clean_text(model_name) or MODEL_DEFAULT,
-                            contents=[
-                                types.Part.from_bytes(data=image_bytes, mime_type=uploaded_image.type or "image/jpeg"),
-                                prompt,
-                            ],
-                            config=config,
-                        )
-                        response_text = getattr(response, "text", None)
-                        if not response_text:
-                            raise ValueError("モデルから空の応答が返されました。")
-                        parsed = json.loads(response_text.strip())
-                        if isinstance(parsed, dict):
-                            parsed = [parsed]
-                        if not isinstance(parsed, list):
-                            raise ValueError("AIの応答がJSON配列ではありません。")
-                        candidates = [
-                            item for item in parsed
-                            if isinstance(item, dict) and (_clean_text(item.get("brewery")) or _clean_text(item.get("name")))
-                        ]
-                        st.session_state["ai_candidates"] = candidates
-                        st.session_state["candidate_select_box"] = 0
-                        st.session_state["last_inference_time"] = round(time.perf_counter() - started, 2)
-                        if candidates:
-                            st.session_state["selected_candidate"] = candidates[0]
-                            # The form is rendered later in this same run, so these assignments occur first.
-                            set_form_from_candidate(candidates[0])
-                            st.success(f"解析完了: {len(candidates)}件 ({st.session_state['last_inference_time']:.2f}秒)。候補を確認してください。")
-                        else:
-                            st.session_state["selected_candidate"] = {}
-                            st.info("ラベル候補を検出できませんでした。手入力してください。")
-                    except Exception as exc:
-                        st.error(f"AI解析に失敗しました: {exc}")
+                        search_url = direct_source_search_url(query, source["id"])
+                        cols[idx % 2].link_button(f"{source['name']}で検索", search_url, use_container_width=True)
+                    except (ValueError, KeyError):
+                        continue
+                generic_url = direct_source_search_url(query, "general")
+                st.link_button("🌐 一般ウェブ検索", generic_url, use_container_width=True)
 
-    candidates = st.session_state.get("ai_candidates", [])
-    if candidates:
-        st.markdown("---")
-        st.subheader("🎯 検出されたラベルの選択")
-        candidate_labels = [
-            f"{i + 1}. {c.get('brewery') or '蔵元不明'} — {c.get('name') or '銘柄不明'} ({c.get('spec_category') or '特定名称不明'})"
-            for i, c in enumerate(candidates)
-        ]
-        st.selectbox(
-            "反映するラベルを選択",
-            options=list(range(len(candidates))),
-            format_func=lambda idx: candidate_labels[idx],
-            key="candidate_select_box",
+        col_local, col_web = st.columns(2)
+        with col_local:
+            local_clicked = st.button(
+                "⚡ 登録済みデータを即時検索",
+                type="secondary",
+                key="run_local_sake_search",
+                use_container_width=True,
+            )
+        with col_web:
+            web_clicked = st.button(
+                "🌐 AIで外部検索",
+                type="primary",
+                key="run_external_sake_search",
+                disabled=not bool(get_gemini_key() and selected_labels and query.strip()),
+                use_container_width=True,
+                help="検索モデルはgemini-2.5-flash。1回のリクエストを15秒でタイムアウトさせ、再試行による長時間待ちを避けます。",
+            )
+
+        if local_clicked or web_clicked:
+            if not query.strip():
+                st.session_state["search_error"] = "銘柄名または読み仮名を入力してください。"
+            else:
+                try:
+                    local_candidates = find_name_candidates(database_url, query, limit=12)
+                    st.session_state["local_name_candidates"] = local_candidates
+                    st.session_state["search_error"] = ""
+                    if local_clicked:
+                        st.session_state["search_candidates"] = local_candidates
+                        st.session_state["search_notes"] = []
+                        st.session_state["grounding_sources"] = []
+                        st.session_state["search_cache_note"] = "登録済みデータだけを検索しました（外部API利用なし）。"
+                        set_flash(f"登録済みデータ：{len(local_candidates)}件", "info")
+                    elif web_clicked:
+                        source_ids = [labels[label] for label in selected_labels]
+                        search_model = get_gemini_search_model()
+                        key = search_cache_key(query, source_ids, search_model)
+                        cached = None if force_search else get_search_cache(database_url, key)
+                        if cached:
+                            payload = cached
+                            st.session_state["search_cache_note"] = "保存済みの外部検索結果（7日間キャッシュ）を表示しています。"
+                        else:
+                            with st.spinner(f"AI外部検索中（{search_model}・最大15秒）…直接検索リンクは上に表示されています"):
+                                payload = grounded_product_search(get_gemini_key(), search_model, query, source_ids)
+                            payload["retrieved_at"] = datetime.now(timezone.utc).isoformat()
+                            put_search_cache(database_url, key, query, source_ids, payload, days=7)
+                            st.session_state["search_cache_note"] = "外部検索結果を取得しました。7日間キャッシュします。"
+                        web_candidates = payload.get("candidates", [])
+                        st.session_state["search_notes"] = payload.get("search_notes", [])
+                        st.session_state["grounding_sources"] = payload.get("grounding_sources", [])
+                        st.session_state["search_candidates"] = local_candidates + web_candidates
+                        st.session_state["last_search_key"] = key
+                        set_flash(f"検索完了：登録済み {len(local_candidates)}件、外部候補 {len(web_candidates)}件", "info")
+                except Exception as exc:
+                    message = str(exc)
+                    st.session_state["search_candidates"] = st.session_state.get("local_name_candidates", [])
+                    st.session_state["search_notes"] = []
+                    st.session_state["grounding_sources"] = []
+                    if "429" in message or "quota" in message.lower() or "too_many_requests" in message.lower():
+                        st.session_state["search_error"] = (
+                            "GeminiのGoogle検索グラウンディングがクォータ制限に達したか、"
+                            "このプロジェクトでは利用できない可能性があります。Neonの接続とは別の問題です。"
+                            "下の情報源別の直接検索リンクは引き続き利用できます。"
+                        )
+                    elif "timeout" in message.lower() or "timed out" in message.lower():
+                        st.session_state["search_error"] = (
+                            "AI検索が15秒以内に応答しませんでした。情報源を1つに絞るか、"
+                            "上の直接検索リンクを利用してください。"
+                        )
+                    else:
+                        st.session_state["search_error"] = f"AI外部検索に失敗しました: {message}"
+
+        if st.session_state.get("search_error"):
+            st.warning(st.session_state["search_error"])
+        if st.session_state.get("search_cache_note"):
+            st.caption(st.session_state["search_cache_note"])
+        candidates = st.session_state.get("search_candidates", [])
+        if candidates:
+            st.markdown("#### 検索候補")
+            for idx, candidate in enumerate(candidates):
+                with st.container(border=True):
+                    product_name = candidate.get("product_name") or candidate.get("name") or "商品名不明"
+                    brewery = candidate.get("brewery") or "蔵元不明"
+                    st.write(f"**{product_name}** — {brewery}")
+                    st.caption(f"情報源：{candidate.get('source_name') or '不明'}")
+                    if candidate.get("name_kana"):
+                        read_status = "登録済み・確認済み" if candidate.get("reading_status") == "confirmed" else "読み候補（未確認）"
+                        st.write(f"読み候補：{candidate['name_kana']}（{read_status}）")
+                    if candidate.get("reading_basis"):
+                        st.caption(f"読みの根拠：{str(candidate['reading_basis'])[:180]}")
+                    safe_candidate_url = canonical_url(candidate.get("source_url"))
+                    if safe_candidate_url:
+                        st.link_button("商品ページを開く", safe_candidate_url)
+                    elif candidate.get("source_id") != "local":
+                        st.warning("商品ページURLを確認できていません。名称・スペックを確定情報とみなさず、直接検索リンクやラベルで確認してください。")
+                    fact_pairs = [
+                        ("特定名称", "spec_category"), ("製法・状態", "processing_state"), ("醸造年度", "by_year"),
+                        ("製造年月/ロット", "lot_date"), ("アルコール度数", "alcohol"), ("日本酒度", "smv"),
+                        ("酸度", "acidity"), ("アミノ酸度", "amino_acid"), ("精米歩合", "rice_polished"),
+                        ("使用米", "rice_used"), ("酵母", "yeast"), ("価格表示", "price_text"), ("在庫表示", "availability"),
+                    ]
+                    shown = [(label, candidate.get(field)) for label, field in fact_pairs if candidate.get(field) is not None]
+                    if shown:
+                        st.write(" / ".join(f"{label}: {value}" for label, value in shown))
+                    if candidate.get("brief_note"):
+                        st.caption(str(candidate["brief_note"])[:180])
+                    if candidate.get("fields_reported_by_ai"):
+                        st.caption("ページに明記とAIが判断した項目（保存前に要確認）:" + ", ".join(candidate["fields_reported_by_ai"]))
+                    st.button("この候補を入力欄へ反映", key=f"apply_search_{idx}", on_click=apply_search_candidate, args=(idx,))
+        elif st.session_state.get("search_cache_note"):
+            st.info("該当する登録済み候補またはAI外部候補はありません。上の直接検索リンクもご利用ください。")
+        for note in st.session_state.get("search_notes", []):
+            st.caption(f"検索メモ：{note}")
+        grounding_sources = st.session_state.get("grounding_sources", [])
+        if grounding_sources:
+            with st.expander("Google検索で参照された出典一覧"):
+                for source in grounding_sources:
+                    title = source.get("title") or source.get("url") or "参照先"
+                    url = source.get("url")
+                    safe_url = canonical_url(url)
+                    if safe_url:
+                        st.link_button(str(title)[:120], safe_url)
+                    else:
+                        st.write(f"- {str(title)[:120]}")
+
+
+def render_entry_page(database_url: str) -> None:
+    st.header("📝 新規測定・入力")
+    render_source_search(database_url)
+
+    with st.expander("📷 ラベル画像からスペック候補を読み取る（任意）", expanded=False):
+        image_file = st.file_uploader("日本酒ラベル画像 (JPEG/PNG)", type=["jpg", "jpeg", "png"], key="label_image")
+        if image_file:
+            image_bytes = image_file.getvalue()
+            current_hash = hashlib.sha256(image_bytes).hexdigest()
+            if st.session_state.get("label_image_hash") != current_hash:
+                st.session_state["label_image_hash"] = current_hash
+                st.session_state["label_candidates"] = []
+            st.image(image_bytes, caption="読み取るラベル", use_container_width=True)
+            if st.button("ラベルをAI解析", key="scan_label"):
+                if not get_gemini_key():
+                    set_flash("AI解析にはGemini APIキーが必要です。", "error")
+                else:
+                    try:
+                        with st.spinner("ラベルを読み取っています..."):
+                            candidates = run_label_scan(get_gemini_key(), get_gemini_model(), image_bytes, image_file.type)
+                        st.session_state["label_candidates"] = candidates
+                        set_flash(f"ラベル解析が完了しました（候補 {len(candidates)}件）。内容を確認してください。", "info")
+                    except Exception as exc:
+                        set_flash(f"ラベル解析に失敗しました: {exc}", "error")
+        label_candidates = st.session_state.get("label_candidates", [])
+        if label_candidates:
+            opts = [f"{i+1}. {x.get('brewery') or '蔵元不明'} — {x.get('name') or '銘柄不明'}" for i, x in enumerate(label_candidates)]
+            st.selectbox("反映するラベル候補", options=range(len(opts)), format_func=lambda i: opts[i], key="selected_label_idx")
+            st.button("選択したラベルを入力欄へ反映", on_click=apply_label_candidate, key="apply_label_candidate")
+
+    st.subheader("銘柄情報")
+    c1, c2 = st.columns(2)
+    with c1:
+        st.text_input("蔵元名 *", key="f_brewery")
+    with c2:
+        st.text_input("銘柄名・商品名 *", key="f_name")
+    reading_col1, reading_col2 = st.columns([2, 1])
+    with reading_col1:
+        st.text_input("銘柄名の読み（ひらがな）", key="f_name_kana", placeholder="例：ほうおうびでん", help="難読・当て字の銘柄名を、次回以降ひらがなで探すために保存します。")
+    with reading_col2:
+        st.checkbox("読みを確認済み", key="f_reading_confirmed", help="実際の読みを確認できた場合のみチェックしてください。外部検索・AI候補の読みは未確認が初期状態です。")
+    st.text_input("蔵元名の読み（任意）", key="f_brewery_kana", placeholder="例：こばやししゅぞう")
+    st.text_area("別名・別読み（任意、カンマ／読点／改行区切り）", key="f_name_aliases", height=68, help="別表記や別の読みがある場合に入力します。")
+    c3, c4, c5 = st.columns([1, 1, 1])
+    with c3:
+        if st.session_state["f_spec_category"] not in SPEC_OPTIONS:
+            SPEC_OPTIONS_CURRENT = SPEC_OPTIONS + [st.session_state["f_spec_category"]]
+        else:
+            SPEC_OPTIONS_CURRENT = SPEC_OPTIONS
+        st.selectbox("特定名称", SPEC_OPTIONS_CURRENT, key="f_spec_category")
+    with c4:
+        st.text_input("製法・状態", key="f_processing_state", placeholder="例：無濾過生原酒、火入れ")
+    with c5:
+        st.text_input("醸造年度（BY）", key="f_by_year", placeholder="例：2025BY")
+    st.text_input("製造年月・ロット", key="f_lot_date", placeholder="例：2026.04")
+
+    st.subheader("糖度の実測値")
+    st.caption("6回分をコンパクトな行で表示します。直接入力または共通ドラムロールで設定できます。実測値は平均化せず個別に保存します。")
+    reset_token = int(st.session_state.get("wheel_reset_token", 0))
+    component_key = f"brix_measurements_{reset_token}"
+    initial_measurements = normalize_measurement_ui_state(st.session_state.get("compact_measurements", {}))
+    brix_measurement_input(
+        data={"resetToken": reset_token, "initialState": initial_measurements},
+        default={"value": initial_measurements},
+        on_value_change=sync_compact_measurements,
+        key=component_key,
+        width="stretch",
+        height=420,
+    )
+
+    st.subheader("任意のスペック情報")
+    st.caption("不明な値はチェックを入れずにおきます。ゼロと未入力を区別します。検索結果を反映した場合も、保存前に値を確認してください。")
+    spec_cols = st.columns(2)
+    numeric_limits = {
+        "alcohol": (0.0, 30.0, 0.1),
+        "smv": (-30.0, 30.0, 0.1),
+        "acidity": (0.0, 5.0, 0.01),
+        "amino_acid": (0.0, 5.0, 0.01),
+        "rice_polished": (0.0, 100.0, 0.1),
+    }
+    for idx, field in enumerate(NUMERIC_SPEC_FIELDS):
+        low, high, step = numeric_limits[field]
+        with spec_cols[idx % 2]:
+            st.checkbox(f"{FIELD_LABELS[field]}を記録する", key=f"has_{field}")
+            st.text_input(
+                FIELD_LABELS[field],
+                key=f"f_{field}",
+                placeholder=f"{low:g}〜{high:g}（任意）",
+                disabled=not st.session_state[f"has_{field}"],
+                help="キーボードから直接入力できます。値は保存時に範囲・桁数を検証します。",
+            )
+    c_rice, c_yeast = st.columns(2)
+    with c_rice:
+        st.text_input("使用米", key="f_rice_used")
+    with c_yeast:
+        st.text_input("使用酵母", key="f_yeast")
+    st.text_area("テイスティングメモ・感想", key="f_memo", height=100)
+
+    st.subheader("保存元情報")
+    source_refs = st.session_state.get("draft_sources", [])
+    if source_refs:
+        for src in source_refs:
+            link = src.get("url")
+            if link:
+                st.markdown(f"- {src.get('source_name', '外部情報')}：[{src.get('product_name') or link}]({link})")
+            else:
+                st.write(f"- {src.get('source_name', '外部情報')}：URL未確認")
+    else:
+        st.caption("外部情報を反映していない場合、出典は登録されません。")
+
+    st.button("💾 実測値・スペックを保存", type="primary", on_click=save_current_measurement, args=(database_url,), key="save_measurement")
+
+
+def render_records_page(database_url: str) -> None:
+    st.header("📚 保存データ・検索・編集")
+    query = st.text_input("蔵元名・銘柄名・メモの部分一致検索", key="record_search")
+    try:
+        rows, total = get_measurements(database_url, query, limit=100)
+    except Exception as exc:
+        st.error(f"データ取得エラー: {exc}")
+        return
+    st.caption(f"全 {total} 件中、最新・該当順に {len(rows)} 件を表示しています（1画面最大100件）。")
+    if not rows:
+        st.info("該当するデータはありません。")
+        return
+    display_fields = ["recorded_at", "brewery", "name", "name_kana", "reading_status", *MEASUREMENT_COLUMNS, "spec_category", "processing_state", *NUMERIC_SPEC_FIELDS, "rice_used", "yeast"]
+    legacy_summary_keys = ("brix", "mean", "average", "avg", "max_val", "maximum", "min_val", "minimum", "range_val", "range", "median", "std_dev", "stdev", "standard_deviation")
+    table_rows = []
+    for row in rows:
+        legacy = row.get("legacy_data") if isinstance(row.get("legacy_data"), dict) else {}
+        legacy_summary = {key: legacy[key] for key in legacy_summary_keys if key in legacy and legacy[key] is not None}
+        table_rows.append(
+            {field: row.get(field) for field in display_fields}
+            | {"過去形式の糖度情報": json.dumps(legacy_summary, ensure_ascii=False) if legacy_summary else "", "id": row.get("id")}
         )
-        st.button(
-            "📥 選択した候補をフォームに反映",
-            on_click=apply_selected_candidate_callback,
-            key="apply_candidate_button",
-        )
-        if st.session_state.get("last_inference_time") is not None:
-            st.caption(f"直近の解析時間: {st.session_state['last_inference_time']:.2f}秒")
+    df = pd.DataFrame(table_rows)
+    st.dataframe(df.drop(columns=["id"]), use_container_width=True, hide_index=True)
+
+    ids = [row["id"] for row in rows]
+    labels = {row["id"]: f"{row.get('recorded_at')} | {row.get('brewery')} — {row.get('name')}" for row in rows}
+    selected_id = st.selectbox("編集・削除するレコード", options=ids, format_func=lambda value: labels.get(value, str(value)), key="selected_record_id")
+    selected = next((row for row in rows if row["id"] == selected_id), None)
+    if selected is None:
+        return
+    if selected.get("legacy_data"):
+        with st.expander("過去バージョンから引き継いだ情報", expanded=False):
+            st.caption("現在のアプリでは集計値を新規計算しません。ここに表示する値は旧記録から引き継いだ参考情報です。個別実測値とは区別してください。")
+            st.json(selected.get("legacy_data"))
+    if selected.get("info_sources"):
+        with st.expander("この記録の情報源", expanded=False):
+            for source in selected.get("info_sources") or []:
+                if not isinstance(source, dict):
+                    st.write(source)
+                    continue
+                url = source.get("url")
+                label = source.get("source_name") or source.get("product_name") or "情報源"
+                safe_url = canonical_url(url)
+                if safe_url:
+                    st.link_button(str(label)[:120], safe_url)
+                else:
+                    st.write(f"- {label}（URL未確認）")
+    with st.expander("選択したレコードを編集", expanded=False):
+        edit_prefix = f"edit_{str(selected_id).replace('-', '_')}"
+        with st.form(f"edit_form_{edit_prefix}"):
+            edit_values: dict[str, Any] = {}
+            for field, label in [("brewery", "蔵元名"), ("name", "銘柄名"), ("name_kana", "銘柄名の読み（ひらがな）"), ("brewery_kana", "蔵元名の読み"), ("by_year", "醸造年度"), ("lot_date", "製造年月・ロット"), ("spec_category", "特定名称"), ("processing_state", "製法・状態"), ("rice_used", "使用米"), ("yeast", "使用酵母")]:
+                edit_values[field] = st.text_input(label, value=str(selected.get(field) or ""), key=f"{edit_prefix}_{field}")
+            st.markdown("**糖度実測値（空欄は未記録）**")
+            for field in MEASUREMENT_COLUMNS:
+                current = selected.get(field)
+                edit_values[field] = st.text_input(
+                    f"{field.upper()} (°Bx)",
+                    value=f"{float(current):.2f}" if current is not None else "",
+                    placeholder="例：8.45（空欄は未記録）",
+                    key=f"{edit_prefix}_{field}",
+                )
+            for field in NUMERIC_SPEC_FIELDS:
+                val = selected.get(field)
+                low, high = {"alcohol": (0.0,30.0), "smv": (-30.0,30.0), "acidity": (0.0,5.0), "amino_acid": (0.0,5.0), "rice_polished": (0.0,100.0)}[field]
+                edit_values[field] = st.text_input(
+                    FIELD_LABELS[field],
+                    value="" if val is None else str(val),
+                    placeholder=f"{low:g}〜{high:g}（任意）",
+                    key=f"{edit_prefix}_{field}",
+                )
+            edit_values["reading_confirmed"] = st.checkbox("銘柄名の読みを確認済み", value=selected.get("reading_status") == "confirmed", key=f"{edit_prefix}_reading_confirmed")
+            edit_values["name_aliases"] = st.text_area("別名・別読み（区切りは読点・カンマ・改行）", value="、".join(selected.get("name_aliases") or []), key=f"{edit_prefix}_name_aliases")
+            edit_values["memo"] = st.text_area("メモ", value=str(selected.get("memo") or ""), key=f"{edit_prefix}_memo")
+            save_edit = st.form_submit_button("変更を保存")
+        if save_edit:
+            try:
+                edit_values["has_alcohol"] = bool(str(edit_values["alcohol"]).strip())
+                edit_values["has_smv"] = bool(str(edit_values["smv"]).strip())
+                edit_values["has_acidity"] = bool(str(edit_values["acidity"]).strip())
+                edit_values["has_amino_acid"] = bool(str(edit_values["amino_acid"]).strip())
+                edit_values["has_rice_polished"] = bool(str(edit_values["rice_polished"]).strip())
+                edit_values["info_sources"] = selected.get("info_sources") or []
+                update_measurement(database_url, str(selected_id), edit_values)
+                set_flash("変更を保存しました。")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"編集エラー: {exc}")
+    with st.expander("選択したレコードを削除", expanded=False):
+        st.warning(f"削除対象：{selected.get('brewery')} — {selected.get('name')}。削除後は元に戻せません。")
+        confirm = st.checkbox("このレコードを削除することを確認しました", key=f"confirm_delete_{edit_prefix}")
+        if st.button("このレコードを削除", disabled=not confirm, key=f"delete_{edit_prefix}"):
+            try:
+                delete_measurement(database_url, str(selected_id))
+                set_flash("レコードを削除しました。")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"削除エラー: {exc}")
+
+
+def render_compare_page(database_url: str) -> None:
+    st.header("⚖️ 実測値の比較")
+    rows, total = get_measurements(database_url, limit=500)
+    if len(rows) < 2:
+        st.info("比較するには2件以上のデータを保存してください。")
+        return
+    ids = [row["id"] for row in rows]
+    labels = {row["id"]: f"{row.get('brewery')} — {row.get('name')} ({row.get('recorded_at')})" for row in rows}
+    selected_ids = st.multiselect("比較する測定記録（複数可）", options=ids, format_func=lambda value: labels.get(value, str(value)), key="compare_ids")
+    if selected_ids:
+        chosen = [row for row in rows if row["id"] in selected_ids]
+        columns = ["recorded_at", "brewery", "name", "name_kana", "reading_status", *MEASUREMENT_COLUMNS, "spec_category", "processing_state", *NUMERIC_SPEC_FIELDS, "rice_used", "yeast"]
+        st.dataframe(pd.DataFrame([{field: row.get(field) for field in columns} for row in chosen]), use_container_width=True, hide_index=True)
+
+
+def render_backup_page(database_url: str) -> None:
+    st.header("🔄 バックアップ・復元")
+    st.write("JSONバックアップは定期的にダウンロードし、GitHubとは別の場所にも保管してください。")
+    try:
+        backup_data = export_json_records(database_url)
+        st.download_button("JSONバックアップをダウンロード", data=backup_data, file_name=f"sake_brix_backup_{datetime.now().date().isoformat()}.json", mime="application/json")
+    except Exception as exc:
+        st.error(f"バックアップ作成に失敗しました: {exc}")
 
     st.markdown("---")
-    with st.form("entry_form", clear_on_submit=False):
-        st.subheader("Step 1: 蔵元名・銘柄名")
-        col1, col2 = st.columns(2)
-        with col1:
-            st.text_input("蔵元名 *", key="input_brewery")
-        with col2:
-            st.text_input("銘柄名・商品名 *", key="input_name", help="例: 〇〇 特別純米 無濾過生原酒")
-
-        st.subheader("Step 2: 糖度の実測値（最大6回・0.01°Bx単位）")
-        st.caption("実測した枠にだけチェックを入れてください。数値0.00も、チェックした場合だけ実測値として扱います。")
-        measurement_columns = st.columns(3)
-        for i in range(1, 7):
-            with measurement_columns[(i - 1) % 3]:
-                st.checkbox(f"測定 {i} を有効にする", key=f"chk_m{i}")
-                # Keep enabled at all times: widgets inside a form do not rerun dynamically.
-                st.number_input(
-                    f"測定 {i} (°Bx)", min_value=0.0, max_value=50.0,
-                    step=0.01, format="%.2f", key=f"val_m{i}",
-                )
-
-        st.subheader("Step 3: スペック詳細・ロット情報")
-        col3, col4, col5 = st.columns(3)
-        with col3:
-            st.selectbox("特定名称", SPEC_OPTIONS, key="input_spec")
-        with col4:
-            st.text_input("製法・状態", key="input_state", help="例: 無濾過生原酒、直汲み、火入れ 等")
-        with col5:
-            st.text_input("醸造年度 (BY)", key="input_by", placeholder="例: 2025BY")
-        st.text_input("製造年月 / ロット", key="input_lot", placeholder="例: 2026.04")
-
-        st.subheader("Step 4: 詳細スペック（未入力はNULL保存）")
-        st.caption("チェックを入れた項目だけ保存します。チェック操作に伴うフォーム再描画を必要としないよう、数値欄は常に編集できます。")
-        col6, col7, col8 = st.columns(3)
-        with col6:
-            st.checkbox("アルコール度数を記録", key="chk_alc")
-            st.number_input("アルコール度数 (%)", min_value=0.0, max_value=30.0, step=0.1, format="%.1f", key="val_alc")
-            st.checkbox("酸度を記録", key="chk_acid")
-            st.number_input("酸度", min_value=0.0, max_value=5.0, step=0.1, format="%.1f", key="val_acid")
-        with col7:
-            st.checkbox("日本酒度を記録", key="chk_smv")
-            st.number_input("日本酒度", min_value=-30.0, max_value=30.0, step=0.5, format="%.1f", key="val_smv")
-            st.checkbox("アミノ酸度を記録", key="chk_amino")
-            st.number_input("アミノ酸度", min_value=0.0, max_value=5.0, step=0.1, format="%.1f", key="val_amino")
-        with col8:
-            st.checkbox("精米歩合を記録", key="chk_rp")
-            st.number_input("精米歩合 (%)", min_value=0.0, max_value=100.0, step=1.0, format="%.1f", key="val_rp")
-            st.text_input("使用米", key="input_rice")
-        st.text_input("使用酵母", key="input_yeast")
-        st.text_area("テイスティングメモ・感想", key="input_memo")
-
-        st.form_submit_button(
-            "💾 測定データを保存する",
-            type="primary",
-            on_click=save_new_record_callback,
-        )
-
-# -----------------------------------------------------------------------------
-# Screen 2: database list, search, edit, delete
-# -----------------------------------------------------------------------------
-elif menu == "📊 保存データ一覧・検索・編集":
-    st.header("📊 保存データ一覧・検索・編集")
-    db_notice = st.session_state.pop("db_notice", None)
-    if db_notice:
-        (st.success if db_notice[0] == "success" else st.error)(db_notice[1])
-
-    search_query = st.text_input("🔍 蔵元名・銘柄名・メモを部分一致検索", key="search_query")
-    start_time = time.perf_counter()
-    escaped = search_query.replace("!", "!!").replace("%", "!%").replace("_", "!_")
-    pattern = f"%{escaped}%"
-    conn = connect_db(DB_NAME)
+    st.subheader("JSONバックアップから復元")
+    uploaded = st.file_uploader("復元するJSONファイルを選択", type=["json"], key="restore_json_file")
+    if uploaded is None:
+        return
     try:
-        if search_query:
-            where = "(COALESCE(brewery, '') LIKE ? ESCAPE '!' OR COALESCE(name, '') LIKE ? ESCAPE '!' OR COALESCE(memo, '') LIKE ? ESCAPE '!')"
-            params = (pattern, pattern, pattern)
-            total_count = conn.execute(f"SELECT COUNT(*) FROM measurements WHERE {where}", params).fetchone()[0]
-            df = pd.read_sql_query(
-                f"SELECT * FROM measurements WHERE {where} ORDER BY recorded_at DESC LIMIT 100", conn, params=params
-            )
-        else:
-            total_count = conn.execute("SELECT COUNT(*) FROM measurements").fetchone()[0]
-            df = pd.read_sql_query("SELECT * FROM measurements ORDER BY recorded_at DESC LIMIT 100", conn)
+        payload = json.loads(uploaded.getvalue().decode("utf-8-sig"))
+        if not isinstance(payload, list):
+            raise ValueError("JSONの最上位は配列である必要があります。")
+        if not payload:
+            raise ValueError("JSONに復元できるレコードがありません。")
+        st.info(f"{len(payload)}件のレコードを検出しました。先頭3件を確認してください。")
+        preview = []
+        errors = []
+        from data_model import normalize_import_record
+        for index, raw in enumerate(payload):
+            try:
+                preview.append(normalize_import_record(raw, row_index=index))
+            except Exception as exc:
+                errors.append(str(exc))
+        if errors:
+            st.error(f"復元前検証で {len(errors)} 件のエラーが見つかりました。データは変更しません。")
+            for err in errors[:10]:
+                st.write(f"- {err}")
+            return
+        safe_preview = [{k: json_safe(v) for k, v in row.items()} for row in preview[:3]]
+        st.dataframe(pd.DataFrame(safe_preview), use_container_width=True, hide_index=True)
+        st.warning("同じIDのレコードはスキップされます。1件でも取り込みエラーが発生した場合は、トランザクション全体をロールバックします。")
+        if st.button("確認したJSONを復元する", type="primary", key="run_restore"):
+            try:
+                added, skipped = restore_json_records(database_url, payload)
+                set_flash(f"復元完了：追加 {added} 件、重複スキップ {skipped} 件")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"復元に失敗しました。追加内容はロールバックされました: {exc}")
     except Exception as exc:
-        st.error(f"検索エラー: {exc}")
-        total_count = 0
-        df = pd.DataFrame()
-    finally:
-        conn.close()
-    elapsed = time.perf_counter() - start_time
-    st.caption(f"検索処理 {elapsed:.4f}秒 / 該当総数 {total_count}件 / 表示 {len(df)}件（最大100件）")
-    if total_count > 100:
-        st.info("現在は先頭100件を表示しています。全件が表示されているわけではありません。")
+        st.error(f"JSONを読み込めませんでした: {exc}")
 
-    if df.empty:
-        st.info("該当するデータがありません。")
-    else:
-        display_columns = [
-            col for col in ["recorded_at", "brewery", "name", "brix", "mean", "spec_category", "processing_state", "alcohol", "smv", "acidity"]
-            if col in df.columns
-        ]
-        st.dataframe(df[display_columns], use_container_width=True, hide_index=True)
 
-        id_to_row = {str(row["id"]): row for _, row in df.iterrows()}
-        available_ids = list(id_to_row.keys())
-        # Reset the selected widget value before creating the widget if filtering
-        # removed the previously selected record.
-        if st.session_state.get("selected_record_id") not in available_ids:
-            st.session_state["selected_record_id"] = available_ids[0]
-        selected_id = st.selectbox(
-            "編集・削除するレコード",
-            options=available_ids,
-            format_func=lambda record_id: (
-                f"{id_to_row[record_id]['recorded_at']} | {id_to_row[record_id]['brewery']} — "
-                f"{id_to_row[record_id]['name']} ({id_to_row[record_id]['mean']}°Bx)"
-            ),
-            key="selected_record_id",
-        )
-        if st.session_state.get("last_selected_record_id") != selected_id:
-            # Do not leave a confirmation checked when the target record changes.
-            st.session_state["confirm_delete_record"] = False
-            st.session_state["last_selected_record_id"] = selected_id
-        target = id_to_row[selected_id]
+def main() -> None:
+    initialise_form_state()
+    st.title("🍶 日本酒 糖度測定・スペック管理 V2")
+    st.caption("糖度は個別の実測値を保存し、集計値は自動計算しません。銘柄名はひらがな読みでも検索できます。")
 
-        col_delete, col_edit = st.columns(2)
-        with col_delete:
-            st.checkbox("このレコードを削除することを確認", key="confirm_delete_record")
-            st.button(
-                "🗑️ 選択したレコードを削除",
-                key="delete_record_button",
-                disabled=not st.session_state.get("confirm_delete_record", False),
-                on_click=delete_record_callback,
-            )
+    st.sidebar.header("⚙️ 接続設定")
+    st.sidebar.write("Neon PostgreSQL")
+    has_db = bool(get_database_url())
+    st.sidebar.write("DB接続情報：" + ("設定済み" if has_db else "未設定"))
+    if "gemini_key" not in st.session_state:
+        st.session_state["gemini_key"] = get_secret("GEMINI_API_KEY")
+    if "gemini_model" not in st.session_state:
+        st.session_state["gemini_model"] = get_secret("GEMINI_MODEL", "gemini-3.8-flash")
+    if "gemini_search_model" not in st.session_state:
+        st.session_state["gemini_search_model"] = get_secret("GEMINI_SEARCH_MODEL", DEFAULT_SEARCH_MODEL)
+    st.sidebar.text_input("Gemini APIキー（この入力は保存されません）", type="password", key="gemini_key")
+    st.sidebar.text_input("ラベル解析用Geminiモデル", key="gemini_model")
+    st.sidebar.text_input("外部検索用Geminiモデル", key="gemini_search_model")
+    st.sidebar.caption("外部検索は既定で gemini-2.5-flash（Google検索の無料枠対応モデル）を使い、15秒でタイムアウト・自動再試行なしにします。サイト別直接検索リンクはGemini APIを使いません。本番ではAPIキーをStreamlit Secretsに設定してください。")
 
-        with col_edit:
-            edit_mode = st.toggle("📝 選択レコードを編集", key="edit_mode")
+    if not has_db:
+        st.error("Neon PostgreSQLへの接続情報がまだ設定されていません。アプリを使う前にStreamlitのSettings → Secretsへ DATABASE_URL を登録してください。")
+        st.code('DATABASE_URL = "postgresql://ユーザー:パスワード@ホスト/データベース?sslmode=require"\nGEMINI_API_KEY = "必要な場合のみ設定"\nGEMINI_MODEL = "gemini-3.8-flash"\nGEMINI_SEARCH_MODEL = "gemini-2.5-flash"', language="toml")
+        st.markdown("- Neonでプロジェクトを作成し、接続文字列をコピーします。\n- Streamlitのアプリ設定 → Secretsへ設定します。\n- DB URLに実際のパスワードを含むため、GitHubやチャットには貼らないでください。")
+        st.stop()
 
-        if edit_mode:
-            suffix = hashlib.sha256(str(selected_id).encode("utf-8")).hexdigest()[:10]
-            def row_missing(key):
-                value = target.get(key)
-                return value is None or pd.isna(value)
-            def row_text(key):
-                return "" if row_missing(key) else str(target[key])
-            def row_float(key, default=0.0):
-                return default if row_missing(key) else float(target[key])
-
-            with st.form(f"edit_form_{suffix}"):
-                st.subheader(f"編集: {target['brewery']} — {target['name']}")
-                ec1, ec2 = st.columns(2)
-                with ec1:
-                    e_brewery = st.text_input("蔵元名 *", value=row_text("brewery"), key=f"edit_{suffix}_brewery")
-                    e_name = st.text_input("銘柄名 *", value=row_text("name"), key=f"edit_{suffix}_name")
-                    e_by = st.text_input("醸造年度 (BY)", value=row_text("by_year"), key=f"edit_{suffix}_by")
-                    e_lot = st.text_input("製造年月 / ロット", value=row_text("lot_date"), key=f"edit_{suffix}_lot")
-                    current_spec = row_text("spec_category") or "未選択"
-                    e_spec = st.selectbox("特定名称", SPEC_OPTIONS, index=(SPEC_OPTIONS.index(current_spec) if current_spec in SPEC_OPTIONS else 0), key=f"edit_{suffix}_spec")
-                    e_state = st.text_input("製法・状態", value=row_text("processing_state"), key=f"edit_{suffix}_state")
-                with ec2:
-                    e_rice = st.text_input("使用米", value=row_text("rice_used"), key=f"edit_{suffix}_rice")
-                    e_yeast = st.text_input("使用酵母", value=row_text("yeast"), key=f"edit_{suffix}_yeast")
-                    e_memo = st.text_area("メモ", value=row_text("memo"), key=f"edit_{suffix}_memo")
-
-                st.markdown("**スペック数値（チェックなしはNULL）**")
-                en1, en2, en3 = st.columns(3)
-                numeric_edit_cfg = [
-                    ("alcohol", "アルコール度数 (%)", 30.0, 0.1, 15.0),
-                    ("smv", "日本酒度", 30.0, 0.5, 0.0),
-                    ("acidity", "酸度", 5.0, 0.1, 1.3),
-                    ("amino_acid", "アミノ酸度", 5.0, 0.1, 1.1),
-                    ("rice_polished", "精米歩合 (%)", 100.0, 1.0, 60.0),
-                ]
-                e_numeric: dict[str, float | None] = {}
-                for idx, (field, label, maxval, step, default_num) in enumerate(numeric_edit_cfg):
-                    container = [en1, en2, en3][idx % 3]
-                    with container:
-                        existing = None if row_missing(field) else float(target[field])
-                        check_key = f"edit_{suffix}_has_{field}"
-                        value_key = f"edit_{suffix}_{field}"
-                        st.checkbox(f"{label}を記録", value=(existing is not None), key=check_key)
-                        st.number_input(
-                            label,
-                            min_value=(-30.0 if field == "smv" else 0.0), max_value=maxval,
-                            step=step, value=(existing if existing is not None else default_num),
-                            format="%.1f", key=value_key,
-                        )
-                        e_numeric[field] = float(st.session_state.get(value_key, default_num)) if st.session_state.get(check_key, existing is not None) else None
-
-                st.markdown("**糖度測定値（有効な値が1つ以上あれば統計値を再計算）**")
-                st.caption("すべて未チェックの場合は既存の糖度測定値・統計値を変更せず、その他の項目だけ更新します。")
-                edit_m_values: list[float | None] = []
-                em_cols = st.columns(3)
-                for i in range(1, 7):
-                    field = f"m{i}"
-                    existing = None if row_missing(field) else float(target[field])
-                    with em_cols[(i - 1) % 3]:
-                        st.checkbox(f"測定 {i} 有効", value=(existing is not None), key=f"edit_{suffix}_chk_m{i}")
-                        st.number_input(
-                            f"測定 {i} (°Bx)", min_value=0.0, max_value=50.0, step=0.01,
-                            value=(existing if existing is not None else 0.0), format="%.2f",
-                            key=f"edit_{suffix}_val_m{i}",
-                        )
-                        edit_m_values.append(
-                            float(st.session_state.get(f"edit_{suffix}_val_m{i}", 0.0))
-                            if st.session_state.get(f"edit_{suffix}_chk_m{i}", existing is not None) else None
-                        )
-
-                edit_submitted = st.form_submit_button("💾 編集内容を保存")
-                if edit_submitted:
-                    if not _clean_text(e_brewery) or not _clean_text(e_name):
-                        st.error("蔵元名と銘柄名は必須です。")
-                    else:
-                        try:
-                            update_fields = {
-                                "brewery": _clean_text(e_brewery), "name": _clean_text(e_name),
-                                "by_year": _clean_text(e_by) or None, "lot_date": _clean_text(e_lot) or None,
-                                "spec_category": e_spec, "processing_state": _clean_text(e_state) or None,
-                                "alcohol": e_numeric["alcohol"], "smv": e_numeric["smv"],
-                                "acidity": e_numeric["acidity"], "amino_acid": e_numeric["amino_acid"],
-                                "rice_polished": e_numeric["rice_polished"], "rice_used": _clean_text(e_rice) or None,
-                                "yeast": _clean_text(e_yeast) or None, "memo": _clean_text(e_memo) or None,
-                            }
-                            valid_edit_m = [x for x in edit_m_values if x is not None]
-                            if valid_edit_m:
-                                update_fields.update(calculate_statistics(edit_m_values))
-                                update_fields.update({f"m{i}": edit_m_values[i - 1] for i in range(1, 7)})
-                            conn = connect_db(DB_NAME)
-                            try:
-                                conn.execute("BEGIN IMMEDIATE")
-                                assignments = ", ".join(f"{column} = ?" for column in update_fields)
-                                values = list(update_fields.values()) + [selected_id]
-                                cursor = conn.execute(f"UPDATE measurements SET {assignments} WHERE id = ?", values)
-                                if cursor.rowcount != 1:
-                                    raise RuntimeError("対象レコードが見つかりません。")
-                                conn.commit()
-                            finally:
-                                conn.close()
-                            st.session_state["db_notice"] = ("success", "レコードを更新しました。")
-                            st.rerun()
-                        except Exception as exc:
-                            st.error(f"更新エラー: {exc}")
-
-# -----------------------------------------------------------------------------
-# Screen 3: compare
-# -----------------------------------------------------------------------------
-elif menu == "⚖️ データ比較":
-    st.header("⚖️ 銘柄データ比較")
-    conn = connect_db(DB_NAME)
-    try:
-        df = pd.read_sql_query(
-            "SELECT id, brewery, name, brix, mean, max_val, min_val, range_val, median, std_dev, "
-            "spec_category, processing_state, alcohol, smv, acidity, amino_acid, rice_polished, "
-            "rice_used, yeast, recorded_at FROM measurements ORDER BY recorded_at DESC", conn
-        )
-    finally:
-        conn.close()
-    if len(df) < 2:
-        st.info("比較するには2件以上のデータを保存してください。")
-    else:
-        labels = {
-            str(row["id"]): f"{row['brewery']} — {row['name']} ({row['mean']}°Bx / {row['recorded_at']})"
-            for _, row in df.iterrows()
-        }
-        selected_ids = st.multiselect(
-            "比較するレコードを選択してください（複数可）",
-            options=list(labels.keys()),
-            format_func=lambda record_id: labels[record_id],
-            key="comparison_ids",
-        )
-        if selected_ids:
-            comp = df[df["id"].astype(str).isin(selected_ids)].copy()
-            st.dataframe(
-                comp[[
-                    "recorded_at", "brewery", "name", "brix", "mean", "max_val", "min_val",
-                    "range_val", "median", "std_dev", "spec_category", "processing_state", "alcohol",
-                    "smv", "acidity", "amino_acid", "rice_polished", "rice_used", "yeast",
-                ]],
-                use_container_width=True,
-                hide_index=True,
-            )
-
-# -----------------------------------------------------------------------------
-# Screen 4: validated JSON restore
-# -----------------------------------------------------------------------------
-elif menu == "🔄 バックアップ・復元":
-    st.header("🔄 データの復元 (JSONインポート)")
-    st.warning("ファイルを選択しただけでは復元されません。内容を確認してから実行してください。")
-    restore_notice = st.session_state.pop("restore_notice", None)
-    if restore_notice:
-        (st.success if restore_notice[0] == "success" else st.error)(restore_notice[1])
-
-    uploaded_json = st.file_uploader("バックアップJSONファイル", type=["json"], key="restore_json_file")
-    if uploaded_json is not None:
-        source_bytes = uploaded_json.getvalue()
+    database_url = get_database_url()
+    if not st.session_state.get("db_initialized"):
         try:
-            parsed_json = json.loads(source_bytes.decode("utf-8-sig"))
-            if not isinstance(parsed_json, list):
-                st.error("JSONの最上位はレコード配列である必要があります。")
-            elif not parsed_json:
-                st.warning("このバックアップにはレコードがありません。復元できるデータは0件です。")
-            else:
-                preview = pd.DataFrame(parsed_json)
-                st.info(f"バックアップ内のレコード数: {len(parsed_json)}件")
-                st.dataframe(preview.head(5), use_container_width=True, hide_index=True)
-                st.caption("最大5件をプレビューしています。旧形式の列名も復元時に対応付けます。")
-                if st.button("🚀 内容を検証して復元を実行", type="primary", key="run_restore"):
-                    try:
-                        normalized_records = normalize_import_records(parsed_json, source_bytes=source_bytes)
-                        counts = restore_records(DB_NAME, normalized_records)
-                        st.success(
-                            f"復元完了: 追加 {counts['added']}件 / 重複スキップ {counts['skipped']}件。"
-                            "このファイルを再度取り込んでも、同じIDは重複追加されません。"
-                        )
-                    except Exception as exc:
-                        st.error(f"復元できませんでした。変更はロールバックされています。詳細: {exc}")
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            st.error(f"JSONを読み込めませんでした: {exc}")
+            with st.spinner("Neon PostgreSQLに接続し、テーブルを確認しています..."):
+                ensure_schema(database_url)
+            st.session_state["db_initialized"] = True
+        except Exception as exc:
+            st.error(f"Neonへの接続・初期化に失敗しました: {exc}")
+            st.info("Neonの接続文字列、パスワード、SSL、プロジェクト状態を確認してください。接続文字列はこの会話に貼らないでください。")
+            st.stop()
 
-st.caption(
-    f"DBファイル: {DB_NAME} ｜ データ件数はローカルDBに保存されています。"
-    "クラウド環境のローカルファイルは消失する場合があるため、定期的にJSONバックアップを保存してください。"
-)
+    if st.session_state.get("flash_message"):
+        kind = st.session_state.get("flash_type", "success")
+        message = st.session_state["flash_message"]
+        if kind == "error":
+            st.error(message)
+        elif kind == "info":
+            st.info(message)
+        else:
+            st.success(message)
+        st.session_state["flash_message"] = ""
+
+    page = st.radio(
+        "メニュー",
+        ["📝 新規測定・入力", "📚 保存データ・検索・編集", "⚖️ 実測値の比較", "🔄 バックアップ・復元", "ℹ️ このアプリについて"],
+        horizontal=True,
+        key="navigation",
+    )
+    if page == "📝 新規測定・入力":
+        render_entry_page(database_url)
+    elif page == "📚 保存データ・検索・編集":
+        render_records_page(database_url)
+    elif page == "⚖️ 実測値の比較":
+        render_compare_page(database_url)
+    elif page == "🔄 バックアップ・復元":
+        render_backup_page(database_url)
+    else:
+        st.header("このアプリについて")
+        st.write("新しい測定記録は個々の実測値を保存し、統計値を自動計算しません。外部銘柄情報は検索候補と出典を確認してからフォームへ反映します。")
+        st.write("DB保存先：Neon PostgreSQL")
+        st.write("検索結果キャッシュ：7日間。キャッシュを使わず再検索するとGemini API利用量が増える場合があります。")
+        st.write("現在の対象：実測値、酒質スペック、テイスティングメモ、外部出典URLです。画像ファイルはDBに保存しません。")
+
+if __name__ == "__main__":
+    main()
