@@ -1140,6 +1140,7 @@ def main() -> None:
     st.caption("糖度は個別の実測値を保存し、集計値は自動計算しません。銘柄名はひらがな読みでも検索できます。")
 
     st.sidebar.header("⚙️ 接続設定")
+    st.sidebar.caption("BUILD CHECK: 2026-10-12-A")
     st.sidebar.write("Neon PostgreSQL")
     has_db = bool(get_database_url())
     st.sidebar.write("DB接続情報：" + ("設定済み" if has_db else "未設定"))
